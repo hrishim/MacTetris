@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Tetris</title>
+<style>
+  :root { color-scheme: dark; }
+  html,body { margin:0; height:100%; background:#0b0e16; color:#e6e6e6;
+              font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+              touch-action: none; -webkit-user-select:none; user-select:none; }
+  #wrap { display:flex; gap:14px; justify-content:center; align-items:flex-start;
+          padding:10px; min-height:100%; }
+  canvas#board { background:#05070c; border:2px solid #3a4152; display:block;
+                 max-height:97vh; width:auto; height:auto; }
+  #side { display:flex; flex-direction:column; gap:10px; width:160px; }
+  .box { background:#11141d; border:1px solid #262c3a; padding:8px; }
+  .box h3 { margin:0 0 4px; font-size:10px; letter-spacing:1px; color:#8a93a5; font-weight:600; }
+  .val { font-size:18px; font-weight:700; }
+  #gold { color:#ffd166; }
+  #msg { min-height:16px; font-size:12px; color:#ffd166; text-align:center; }
+  .keys { font-size:10px; line-height:1.8; color:#8a93a5; }
+  button { background:#26415e; color:#fff; border:0; padding:7px 0; width:100%;
+           font:inherit; font-size:12px; cursor:pointer; border-radius:4px; }
+  @media (max-width:640px){ #side{ width:120px } .val{ font-size:14px } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="board" width="240" height="480"></canvas>
+  <div id="side">
+    <div class="box"><h3>HOLD</h3><canvas id="hold" width="140" height="36"></canvas></div>
+    <div class="box"><h3>NEXT</h3><canvas id="next" width="140" height="120"></canvas></div>
+    <div class="box"><h3>SCORE</h3><div class="val" id="score">0</div></div>
+    <div class="box"><h3>LINES / LEVEL</h3><div class="val"><span id="lines">0</span> / <span id="level">1</span></div></div>
+    <div class="box"><h3>HIGH SCORES</h3><div class="val" id="gold" style="font-size:13px"></div></div>
+    <div class="box keys">←→ move · ↑/X rotate · Z ccw<br>↓ soft · Space hard · C hold<br>P pause · R restart · M mute<br>touch: tap rot · drag move · flick↓ drop</div>
+    <button id="restart">Restart</button>
+    <div id="msg"></div>
+  </div>
+</div>
+<script>
+"use strict";
+// ===== BEGIN ENGINE (pure logic, no DOM) =====
+// [engine]
+const COLS = 10, ROWS = 20, LOCK_DELAY = 0.5, MAX_LOCK_RESETS = 15;
+const TYPES = ["I","O","T","S","Z","J","L"];
+const SHAPES = {
+  I: [[ [0,1],[1,1],[2,1],[3,1] ], [ [2,0],[2,1],[2,2],[2,3] ], [ [0,2],[1,2],[2,2],[3,2] ], [ [1,0],[1,1],[1,2],[1,3] ]],
+  O: [[ [1,0],[2,0],[1,1],[2,1] ], [ [1,0],[2,0],[1,1],[2,1] ], [ [1,0],[2,0],[1,1],[2,1] ], [ [1,0],[2,0],[1,1],[2,1] ]],
+  T: [[ [1,0],[0,1],[1,1],[2,1] ], [ [1,0],[1,1],[2,1],[1,2] ], [ [0,1],[1,1],[2,1],[1,2] ], [ [1,0],[0,1],[1,1],[1,2] ]],
+  S: [[ [1,0],[2,0],[0,1],[1,1] ], [ [1,0],[1,1],[2,1],[2,2] ], [ [1,1],[2,1],[0,2],[1,2] ], [ [0,0],[0,1],[1,1],[1,2] ]],
+  Z: [[ [0,0],[1,0],[1,1],[2,1] ], [ [2,0],[1,1],[2,1],[1,2] ], [ [1,0],[2,0],[0,1],[1,1] ], [ [1,0],[0,1],[1,1],[0,2] ]],
+  J: [[ [0,0],[0,1],[1,1],[2,1] ], [ [1,0],[2,0],[1,1],[1,2] ], [ [0,1],[1,1],[2,1],[2,2] ], [ [1,0],[1,1],[0,2],[1,2] ]],
+  L: [[ [2,0],[0,1],[1,1],[2,1] ], [ [1,0],[1,1],[1,2],[2,2] ], [ [0,1],[1,1],[2,1],[0,2] ], [ [0,0],[0,1],[0,2],[1,2] ]],
+};
+// SRS kick tables (y-up); inverted to screen y at use
+const KICKS_J = [
+  [[0,0],[-1,0],[-1, 1],[0,-2],[-1,-2]],
+  [[0,0],[ 1,0],[ 1,-1],[0, 2],[ 1, 2]],
+  [[0,0],[ 1,0],[ 1,-1],[0, 2],[ 1, 2]],
+  [[0,0],[-1,0],[-1,-1],[0, 2],[-1, 2]],
+];
+const KICKS_I = [
+  [[0,0],[-2,0],[ 1,0],[-2,-1],[ 1, 2]],
+  [[0,0],[-1,0],[ 2,0],[-1, 2],[ 2,-1]],
+  [[0,0],[ 2,0],[-1,0],[ 2, 1],[-1,-2]],
+  [[0,0],[ 1,0],[-2,0],[ 1,-2],[-2, 1]],
+];
+function kicks(type, from, dir) {
+  if (type === "O") return [[0,0]];
+  const t = type === "I" ? KICKS_I : KICKS_J;
+  if (dir === 1) return t[from].map(([x,y]) => [x, -y]);
+  const to = (from + 3) % 4;
+  return t[to].map(([x,y]) => [-x, y]);
+}
+
+class Game {
+  constructor(rng) {
+    this.rng = rng || Math.random;
+    this.grid = Array.from({length: ROWS}, () => Array(COLS).fill(null));
+    this.bag = []; this.queue = [];
+    for (let i = 0; i < 4; i++) this.queue.push(this._next());
+    this.current = null; this.hold = null; this.canHold = true;
+    this.score = 0; this.lines = 0; this.level = 1;
+    this.combo = -1; this.b2b = false;
+    this.state = "playing"; this.elapsed = 0;
+    this.dropAccum = 0; this.lockTimer = 0; this.lockResets = 0; this.lowestY = 0;
+    this.onEvent = () => {};
+    this._spawn();
+  }
+  _next() {
+    if (!this.bag.length) {
+      this.bag = TYPES.slice();
+      for (let i = this.bag.length - 1; i > 0; i--) {
+        const j = Math.floor(this.rng() * (i + 1));
+        [this.bag[i], this.bag[j]] = [this.bag[j], this.bag[i]];
+      }
+    }
+    return this.bag.pop();
+  }
+  _cells(p, rot, dx = 0, dy = 0) {
+    return SHAPES[p.type][rot === undefined ? p.rot : rot]
+      .map(([x,y]) => [x + p.x + dx, y + p.y + dy]);
+  }
+  _collides(p, rot, dx = 0, dy = 0) {
+    for (const [x, y] of this._cells(p, rot, dx, dy)) {
+      if (x < 0 || x >= COLS || y >= ROWS) return true;
+      if (y >= 0 && this.grid[y][x]) return true;
+    }
+    return false;
+  }
+  _spawn() {
+    const t = this.queue.shift(); this.queue.push(this._next());
+    this.current = { type: t, rot: 0, x: 3, y: 0 };
+    this.canHold = true; this.lockTimer = 0; this.lockResets = 0;
+    if (this._collides(this.current)) {
+      const q = { ...this.current, y: -1 };
+      if (this._collides(q)) { this._die(); return; }
+      this.current = q;
+    }
+    this.lowestY = this.current.y;
+  }
+  _die() {
+    if (this.state !== "over") { this.state = "over"; this.onEvent({ t: "over" }); }
+  }
+  _grounded() { return this._collides(this.current, undefined, 0, 1); }
+  _resetLock() {
+    if (this._grounded() && this.lockResets < MAX_LOCK_RESETS) {
+      this.lockTimer = 0; this.lockResets++;
+    }
+  }
+  tryMove(dx) {
+    if (this.state !== "playing") return;
+    if (!this._collides(this.current, undefined, dx, 0)) {
+      this.current.x += dx; this.onEvent({ t: "move" }); this._resetLock();
+    }
+  }
+  tryRotate(dir) {
+    if (this.state !== "playing") return;
+    const nr = (this.current.rot + dir + 4) % 4;
+    for (const [kx, ky] of kicks(this.current.type, this.current.rot, dir)) {
+      if (!this._collides(this.current, nr, kx, ky)) {
+        this.current.rot = nr; this.current.x += kx; this.current.y += ky;
+        this.onEvent({ t: "rotate" }); this._resetLock();
+        return;
+      }
+    }
+  }
+  trySoftDrop() {
+    if (this.state !== "playing") return false;
+    if (!this._collides(this.current, undefined, 0, 1)) {
+      this.current.y++; this.score++;
+      if (this.current.y > this.lowestY) { this.lowestY = this.current.y; this.lockTimer = 0; this.lockResets = 0; }
+      return true;
+    }
+    return false;
+  }
+  hardDrop() {
+    if (this.state !== "playing") return;
+    let d = 0;
+    while (!this._collides(this.current, undefined, 0, 1)) { this.current.y++; d++; }
+    this.score += 2 * d;
+    this.onEvent({ t: "drop" });
+    this._lock();
+  }
+  doHold() {
+    if (this.state !== "playing" || !this.canHold) return;
+    this.onEvent({ t: "hold" });
+    const cur = this.current.type;
+    if (this.hold) {
+      this.current = { type: this.hold, rot: 0, x: 3, y: 0 };
+      if (this._collides(this.current)) {
+        this.current.y = -1;
+        if (this._collides(this.current)) { this._die(); return; }
+      }
+      this.hold = cur;
+    } else { this.hold = cur; this._spawn(); }
+    this.canHold = false; this.lockTimer = 0; this.lockResets = 0;
+    this.lowestY = this.current.y;
+  }
+  gravityInterval() {
+    const l = this.level;
+    return Math.max(Math.pow(0.8 - (l - 1) * 0.007, l - 1), 1/60);
+  }
+  update(dt) {
+    if (this.state !== "playing") return;
+    this.elapsed += dt;
+    if (this._grounded()) {
+      this.lockTimer += dt;
+      if (this.lockTimer >= LOCK_DELAY) this._lock();
+    } else {
+      this.lockTimer = 0;
+      this.dropAccum += dt;
+      while (this.dropAccum >= this.gravityInterval()) {
+        this.dropAccum -= this.gravityInterval();
+        if (!this._collides(this.current, undefined, 0, 1)) {
+          this.current.y++;
+          if (this.current.y > this.lowestY) { this.lowestY = this.current.y; this.lockResets = 0; }
+          if (this._grounded()) break;
+        } else break;
+      }
+    }
+  }
+  _lock() {
+    const prevLevel = this.level;
+    for (const [x, y] of this._cells(this.current)) {
+      if (y < 0) { this._die(); return; }
+      this.grid[y][x] = this.current.type;
+    }
+    let cleared = 0;
+    for (let r = ROWS - 1; r >= 0; r--) {
+      if (this.grid[r].every(c => c)) {
+        this.grid.splice(r, 1);
+        this.grid.unshift(Array(COLS).fill(null));
+        cleared++; r++;
+      }
+    }
+    if (cleared > 0) {
+      let pts = [0,100,300,500,800][cleared] * this.level;
+      const diff = cleared === 4;
+      if (this.b2b && diff) pts = Math.floor(pts * 1.5);
+      this.b2b = diff;
+      this.combo++;
+      if (this.combo > 0) pts += 50 * this.combo * this.level;
+      if (this.grid.every(row => row.every(c => !c)) && cleared < 4) pts += 1000 * this.level;
+      this.score += pts;
+      this.lines += cleared;
+      this.level = 1 + Math.floor(this.lines / 10);
+    } else { this.combo = -1; }
+    this.onEvent({ t: "clear", n: cleared });
+    if (this.level > prevLevel) this.onEvent({ t: "level" });
+    this._spawn();
+  }
+}
+// [engine]
+// ===== END ENGINE =====
+
+// ===== UI =====
+const COLORS = { I:"#3ec7f0", O:"#f5d332", T:"#b56cf0", S:"#4ade80", Z:"#f05a5a", J:"#5a7bf0", L:"#f0913e" };
+const cv = document.getElementById("board"), ctx = cv.getContext("2d");
+const SZ = cv.width / COLS;
+let game = new Game(), recorded = false, paused = false, muted = false;
+let bestList = loadBest();
+
+// sound: tiny WebAudio synth
+let AC = null, lastSfx = 0;
+function beep(f0, f1, dur, gain, when = 0) {
+  if (muted) return;
+  try {
+    if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+    const t0 = AC.currentTime + when;
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.frequency.setValueAtTime(f0, t0);
+    o.frequency.exponentialRampToValueAtTime(Math.max(f1, 1), t0 + dur);
+    g.gain.setValueAtTime(gain, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g).connect(AC.destination);
+    o.start(t0); o.stop(t0 + dur + 0.02);
+  } catch (e) {}
+}
+function sfx(name) {
+  if (muted) return;
+  const now = performance.now();
+  if (name === "move" && now - lastSfx < 30) return;
+  lastSfx = now;
+  const s = {
+    move:   () => beep(700, 700, 0.012, 0.05),
+    rotate: () => beep(920, 1100, 0.03, 0.08),
+    drop:   () => { beep(300, 140, 0.05, 0.12); beep(90, 60, 0.04, 0.14, 0.03); },
+    hold:   () => beep(540, 660, 0.045, 0.09),
+    clear1: () => beep(660, 880, 0.07, 0.10),
+    clear2: () => { beep(660, 660, 0.05, 0.10); beep(880, 880, 0.06, 0.10, 0.05); },
+    clear3: () => { [660, 830, 1046].forEach((f, i) => beep(f, f, 0.05, 0.10, i * 0.045)); },
+    tetris: () => { [523, 659, 784, 1046].forEach((f, i) => beep(f, f, 0.07, 0.11, i * 0.06)); },
+    level:  () => { [440, 554, 659].forEach((f, i) => beep(f, f, 0.06, 0.09, i * 0.05)); },
+    over:   () => beep(420, 100, 0.45, 0.12),
+  };
+  (s[name] || (()=>{}))();
+}
+game.onEvent = e => {
+  if (e.t === "clear") sfx(e.n === 0 ? "drop" : e.n === 4 ? "tetris" : "clear" + Math.min(e.n, 3));
+  else sfx(e.t);
+};
+
+function loadBest() {
+  try { return JSON.parse(localStorage.getItem("tetris.high") || "[]"); } catch (e) { return []; }
+}
+function saveBest(score) {
+  const list = loadBest();
+  const isBest = score > 0 && score > (list[0] ? list[0].score : 0);
+  list.push({ score });
+  list.sort((a, b) => b.score - a.score);
+  localStorage.setItem("tetris.high", JSON.stringify(list.slice(0, 10)));
+  bestList = loadBest();
+  return isBest;
+}
+let newBest = false;
+
+function restart() {
+  game = new Game();
+  game.onEvent = e => {
+    if (e.t === "clear") sfx(e.n === 0 ? "drop" : e.n === 4 ? "tetris" : "clear" + Math.min(e.n, 3));
+    else sfx(e.t);
+  };
+  recorded = false; newBest = false; paused = false; msg("");
+}
+function msg(s) { document.getElementById("msg").textContent = s; }
+
+// keyboard
+const keys = {};
+addEventListener("keydown", e => {
+  if (["ArrowLeft","ArrowRight","ArrowDown","ArrowUp"," "].includes(e.key)) e.preventDefault();
+  if (game.state !== "playing" && e.key.toLowerCase() !== "r") {
+    if (e.key.toLowerCase() === "p" || e.key === "Escape") { paused = !paused; msg(paused ? "PAUSED" : ""); }
+    if (game.state !== "over") return;
+  }
+  switch (e.key) {
+    case "ArrowLeft":  game.tryMove(-1); break;
+    case "ArrowRight": game.tryMove(1);  break;
+    case "ArrowDown":  game.trySoftDrop(); break;
+    case "ArrowUp": case "x": case "X": game.tryRotate(1);  break;
+    case "z": case "Z": game.tryRotate(-1); break;
+    case " ": game.hardDrop(); break;
+    case "c": case "C": game.doHold(); break;
+    case "p": case "P": case "Escape": paused = !paused; msg(paused ? "PAUSED" : ""); break;
+    case "r": case "R": restart(); break;
+    case "m": case "M": muted = !muted; msg(muted ? "sound: off" : "sound: on"); break;
+  }
+});
+
+// touch: drag left/right zones = move, tap = rotate, flick down = hard drop
+let tx = 0, ty = 0, tt = 0, moved = 0, dropFired = false;
+cv.addEventListener("touchstart", e => {
+  const t = e.changedTouches[0];
+  tx = t.clientX; ty = t.clientY; tt = performance.now(); moved = 0; dropFired = false;
+  e.preventDefault();
+}, { passive: false });
+cv.addEventListener("touchmove", e => {
+  const t = e.changedTouches[0];
+  const dx = t.clientX - tx, dy = t.clientY - ty;
+  if (Math.abs(dx) > Math.abs(dy)) {
+    while (dx - moved >= 28) { game.tryMove(1);  moved += 28; }
+    while (dx + moved <= -28) { game.tryMove(-1); moved += 28; }
+  } else {
+    if (!dropFired && dy > 60 && performance.now() - tt < 300) { game.hardDrop(); dropFired = true; }
+    if (dy < -40) { game.tryRotate(1); ty = t.clientY; }
+  }
+  e.preventDefault();
+}, { passive: false });
+cv.addEventListener("touchend", e => {
+  if (!dropFired && moved === 0 && performance.now() - tt < 250) game.tryRotate(1);
+  e.preventDefault();
+}, { passive: false });
+cv.addEventListener("contextmenu", e => e.preventDefault());
+
+// drawing
+function cell(c, x, y, color, ghost) {
+  const px = x * SZ, py = y * SZ;
+  if (ghost) {
+    c.globalAlpha = 0.28; c.fillStyle = color; c.fillRect(px + 1, py + 1, SZ - 2, SZ - 2);
+    c.globalAlpha = 1; c.strokeStyle = color; c.lineWidth = 1.2; c.strokeRect(px + 2, py + 2, SZ - 4, SZ - 4);
+  } else {
+    c.fillStyle = color; c.fillRect(px + 1, py + 1, SZ - 2, SZ - 2);
+    c.fillStyle = "rgba(255,255,255,.28)"; c.fillRect(px + 1, py + 1, SZ - 2, 3);
+  }
+}
+function mini(id, type) {
+  const c = document.getElementById(id).getContext("2d");
+  const W = c.canvas.width, H = c.canvas.height;
+  c.clearRect(0, 0, W, H);
+  if (!type) return;
+  const cells = SHAPES[type][0], m = 10;
+  const minX = Math.min(...cells.map(a => a[0])), maxX = Math.max(...cells.map(a => a[0]));
+  const minY = Math.min(...cells.map(a => a[1])), maxY = Math.max(...cells.map(a => a[1]));
+  const ox = (W - (maxX - minX + 1) * m) / 2 - minX * m, oy = (H - (maxY - minY + 1) * m) / 2 - minY * m;
+  c.fillStyle = COLORS[type];
+  for (const [x, y] of cells) c.fillRect(ox + x * m + 1, oy + y * m + 1, m - 1, m - 1);
+}
+function draw() {
+  ctx.fillStyle = "#05070c"; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.strokeStyle = "rgba(255,255,255,.05)";
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) ctx.strokeRect(c * SZ, r * SZ, SZ, SZ);
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++)
+    if (game.grid[r][c]) cell(ctx, c, r, COLORS[game.grid[r][c]]);
+  if (game.state === "playing" && game.current && !paused) {
+    let gy = 0; while (!game._collides(game.current, undefined, 0, gy + 1)) gy++;
+    ctx.save();
+    for (const [x, y] of game._cells(game.current, undefined, 0, gy)) if (y >= 0) cell(ctx, x, y, COLORS[game.current.type], true);
+    ctx.restore();
+    for (const [x, y] of game._cells(game.current)) if (y >= 0) cell(ctx, x, y, COLORS[game.current.type]);
+  }
+  mini("hold", game.hold);
+  // next queue
+  const nc = document.getElementById("next").getContext("2d");
+  nc.clearRect(0, 0, 140, 120);
+  game.queue.slice(0, 3).forEach((t, i) => {
+    const cells = SHAPES[t][0], m = 9;
+    const minX = Math.min(...cells.map(a => a[0])), maxX = Math.max(...cells.map(a => a[0]));
+    const minY = Math.min(...cells.map(a => a[1])), maxY = Math.max(...cells.map(a => a[1]));
+    const ox = (140 - (maxX - minX + 1) * m) / 2 - minX * m, oy = i * 40 + (36 - (maxY - minY + 1) * m) / 2 - minY * m;
+    nc.fillStyle = COLORS[t];
+    for (const [x, y] of cells) nc.fillRect(ox + x * m + 1, oy + y * m + 1, m - 1, m - 1);
+  });
+  document.getElementById("score").textContent = game.score;
+  document.getElementById("lines").textContent = game.lines;
+  document.getElementById("level").textContent = game.level;
+  document.getElementById("gold").innerHTML = bestList.slice(0, 3).map((e, i) =>
+    (i === 0 && newBest ? "<b style='color:#ffe08a'>" : "<span>") + (i + 1) + ". " + e.score + (i === 0 && newBest ? "</b>" : "</span>")
+  ).join("<br>") || "—";
+  if (game.state === "over" || paused) {
+    ctx.fillStyle = "rgba(0,0,0,.55)"; ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.fillStyle = "#fff"; ctx.textAlign = "center";
+    ctx.font = "bold 20px ui-monospace, Menlo, monospace";
+    ctx.fillText(game.state === "over" ? (newBest ? "NEW BEST!" : "GAME OVER") : "PAUSED", cv.width / 2, cv.height / 2 - 6);
+    ctx.font = "11px ui-monospace, Menlo, monospace"; ctx.fillStyle = "#aab";
+    ctx.fillText(game.state === "over" ? "press R / tap to restart" : "press P to resume", cv.width / 2, cv.height / 2 + 16);
+  }
+}
+cv.addEventListener("pointerup", () => { if (game.state === "over") restart(); });
+
+let last = performance.now();
+function frame(t) {
+  const dt = Math.min((t - last) / 1000, 0.1); last = t;
+  if (!paused && game.state === "playing") game.update(dt);
+  if (game.state === "over" && !recorded) {
+    recorded = true;
+    newBest = saveBest(game.score);
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
